@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Handover</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html,body{margin:0;height:100%;background:#fff;font-family:-apple-system,"Helvetica Neue",sans-serif;color:#111}
+  body{display:flex;align-items:center;justify-content:center;overflow:hidden}
+  #frame{position:relative;width:min(64vw,calc(64vh*4/3),860px);aspect-ratio:4/3}
+  #cam{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);opacity:0;
+       border-radius:6px;box-shadow:0 8px 40px rgba(0,0,0,.18);transition:opacity .45s ease}
+  #px{position:fixed;left:0;top:0;width:100vw;height:100vh;opacity:0;transition:opacity .45s ease;pointer-events:none}
+  body.s11 #cam{opacity:1}
+  body.s11.trans #cam{transition:opacity 1.4s ease .4s}
+  body.s10 #px,body.trans #px{opacity:1}
+  #bar{position:fixed;left:16px;top:14px;display:flex;gap:10px;align-items:center;font-size:13px;z-index:5}
+  button{font:inherit;padding:5px 12px;border:1px solid #111;background:#fff;border-radius:999px;cursor:pointer}
+  button:hover{background:#111;color:#fff}
+  #state{font-variant-numeric:tabular-nums;letter-spacing:.05em}
+  #hint{position:fixed;bottom:14px;left:0;right:0;text-align:center;font-size:12px;color:#888;z-index:5}
+  #frame{container-type:inline-size}
+  #sharedText{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;
+    color:#000;font-weight:500;letter-spacing:.01em;font-size:6vw;font-size:9.5cqw;opacity:0;transition:opacity .4s ease}
+  #sharedText.on{opacity:1}
+  #prompt{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:0 10vw;box-sizing:border-box;
+    pointer-events:none;z-index:3;color:#111;font-weight:500;letter-spacing:.005em;font-size:22px;font-size:clamp(20px,2.2vw,32px);
+    opacity:0;transition:opacity .8s ease}
+  #prompt.on{opacity:1}
+  [hidden]{display:none!important}
+  #bar button{font-size:16px}                /* Connect 按钮与右上角 Gallery 按钮字号一致 */
+  #btnGallery{position:fixed;right:16px;top:14px;z-index:6;transition:background .2s,color .2s}
+  #btnGallery.pulse{background:#111;color:#fff}
+  #gallery{position:fixed;inset:0;background:#fff;z-index:20;overflow:auto;padding:64px 24px 32px;box-sizing:border-box}
+  #galBar{position:fixed;left:0;right:0;top:0;height:52px;display:flex;align-items:center;gap:10px;padding:0 16px;background:rgba(255,255,255,.92);z-index:21;font-size:13px}
+  #galBar .sp{flex:1}
+  #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:16px}
+  #grid figure{margin:0}
+  #grid img{width:100%;display:block;border-radius:4px;cursor:zoom-in;background:#eee}
+  #grid figcaption{font-size:11px;color:#888;margin-top:6px;font-variant-numeric:tabular-nums}
+  #galEmpty{color:#999;font-size:13px;text-align:center;margin-top:30vh}
+  #box{position:fixed;inset:0;z-index:30;background:rgba(255,255,255,.97);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px}
+  #box img{max-width:90vw;max-height:78vh;border-radius:6px;box-shadow:0 8px 40px rgba(0,0,0,.18)}
+  #box .row{display:flex;gap:10px;align-items:center;font-size:13px}
+  #box a{font:inherit;padding:5px 12px;border:1px solid #111;border-radius:999px;color:#111;text-decoration:none}
+  #box a:hover{background:#111;color:#fff}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+</head>
+<body class="s00">
+<div id="bar">
+  <button id="btnSerial">Connect board</button>
+  <span id="state">(0, 0)</span>
+</div>
+<div id="frame"><video id="cam" autoplay playsinline muted></video><div id="sharedText">shared!</div></div>
+<canvas id="px"></canvas>
+<div id="prompt"></div>
+<button id="btnGallery">Gallery (0)</button>
+<div id="gallery" hidden>
+  <div id="galBar"><b>Gallery</b><span id="galCount" style="color:#888"></span><span class="sp"></span>
+    <button id="btnClear">Clear all</button><button id="btnClose">Close</button></div>
+  <div id="grid"></div><div id="galEmpty">No moments captured yet</div>
+</div>
+<div id="box" hidden><img id="boxImg" alt=""><div class="row"><span id="boxTime" style="color:#888"></span>
+  <a id="boxDl" download>Download</a><button id="boxDel">Delete</button><button id="boxClose">Back</button></div></div>
+<div id="hint">Loading models… (internet needed on first load)</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const cam = $('cam'), px = $('px'), ctx = px.getContext('2d');
+const hint = t => $('hint').textContent = t;
+
+// ===== 可调参数 =====
+const CELL = 6;                          // 像素块大小(px)
+const SEG_LOW = 0.35, SEG_HIGH = 0.70;   // 分割置信度阈值(调低:手更胖/更完整;调高:更瘦/更干净)
+
+let GW, GH, off, octx, rnd, rndB, rndC, ccv, cctx, mask, target, roi, lut, lutKey = '';
+function setupGrid(){
+  GW = Math.ceil(innerWidth / CELL); GH = Math.ceil(innerHeight / CELL);
+  off = document.createElement('canvas'); off.width = GW; off.height = GH;
+  octx = off.getContext('2d', {willReadFrequently:true});
+  rnd = Float32Array.from({length:GW*GH}, Math.random);
+  rndB = Float32Array.from({length:GW*GH}, Math.random); rndC = Float32Array.from({length:GW*GH}, Math.random);
+  ccv = document.createElement('canvas'); ccv.width = GW; ccv.height = GH; cctx = ccv.getContext('2d', {willReadFrequently:true});
+  mask = new Float32Array(GW*GH); target = new Float32Array(GW*GH); roi = new Float32Array(GW*GH);
+  lut = new Int32Array(GW*GH); lutKey = '';
+  const dpr = devicePixelRatio || 1;
+  px.width = Math.round(innerWidth*dpr); px.height = Math.round(innerHeight*dpr);
+}
+setupGrid(); addEventListener('resize', setupGrid);
+
+// ---------- state ----------
+let trans = false, tStart = 0, prevCls = 's00', capTimer = null;
+const SHARED_SHOW = 600, SHARED_HIDE = 3300;   // "shared!" 出现 / 开始消失的时间(接触后多少毫秒);只是显示,不会拍进照片里
+let shTimer1 = null, shTimer2 = null;
+function setBits(a,b){
+  $('state').textContent = `(${a}, ${b})`;
+  const cls = (a&&b) ? 's11' : (a||b) ? 's10' : 's00';
+  if(cls === 's11' && prevCls === 's10'){ trans = true; tStart = performance.now(); }   // (1,0)/(0,1) -> (1,1):开始渐变
+  if(cls !== 's11') trans = false;
+  document.body.className = cls + (trans ? ' trans' : '');
+  if(cls === 's11' && prevCls !== 's11'){ clearTimeout(capTimer); capTimer = setTimeout(capture, CAPTURE_DELAY); }   // 变成 (1,1) 后延迟抓拍一张
+  if(cls !== 's11'){ clearTimeout(capTimer); capTimer = null; }
+  if(cls === 's11' && prevCls !== 's11'){                                                                        // 显示 "shared!"
+    clearTimeout(shTimer1); clearTimeout(shTimer2);
+    shTimer1 = setTimeout(() => $('sharedText').classList.add('on'), SHARED_SHOW);
+    shTimer2 = setTimeout(() => $('sharedText').classList.remove('on'), SHARED_HIDE);
+  }
+  if(cls !== 's11'){ clearTimeout(shTimer1); clearTimeout(shTimer2); $('sharedText').classList.remove('on'); }                                                   // 中途松开则取消
+  updatePrompt(cls);
+  prevCls = cls;
+}
+const keys = {};
+addEventListener('keydown', e=>{ if(e.key==='1'||e.key==='2'){ keys[e.key]=1; setBits(keys['1']|0, keys['2']|0); } });
+addEventListener('keyup',   e=>{ if(e.key==='1'||e.key==='2'){ keys[e.key]=0; setBits(keys['1']|0, keys['2']|0); } });
+
+// ---------- serial (Chrome / Edge only) ----------
+$('btnSerial').onclick = async () => {
+  if(!('serial' in navigator)){ alert('Connecting the board needs Chrome or Edge (Safari does not support Web Serial).'); return; }
+  try{
+    const port = await navigator.serial.requestPort();
+    await port.open({baudRate:115200});
+    $('btnSerial').textContent = 'Connected';
+    const reader = port.readable.pipeThrough(new TextDecoderStream()).getReader();
+    let buf = '';
+    for(;;){
+      const {value, done} = await reader.read(); if(done) break;
+      buf += value; const lines = buf.split('\n'); buf = lines.pop();
+      for(const l of lines){ const m = l.match(/([01])\s*,\s*([01])/); if(m) setBits(+m[1], +m[2]); }
+    }
+  }catch(err){ console.warn(err); $('btnSerial').textContent = 'Connect board'; }
+};
+
+// ---------- 1) 手部关键点:只用来圈出"手大概在哪"(ROI),并去掉手臂 ----------
+const FINGERS = [[5,6,7,8],[9,10,11,12],[13,14,15,16],[17,18,19,20]];
+const FINGER_W = [0.20,0.18,0.15], FINGER_MUL = [1.0,1.05,0.95,0.8], THUMB_W = [0.28,0.24,0.20];
+function toGrid(p){
+  const ar = cam.videoWidth/cam.videoHeight, fa = GW/GH;
+  let x = p.x, y = p.y;
+  if(ar > fa){ const f = fa/ar; x = (x-(1-f)/2)/f; } else { const f = ar/fa; y = (y-(1-f)/2)/f; }
+  return [(1-x)*GW, y*GH];
+}
+const lerp = (a,b,t) => [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t];
+const norm = v => { const l = Math.hypot(v[0],v[1]) || 1; return [v[0]/l, v[1]/l]; };
+
+// k>1:宽松的包围区域(配合真实分割使用);k=1:骨架轮廓(分割模型加载失败时的备用方案)
+function drawEnvelope(list, k, out){
+  octx.fillStyle = '#000'; octx.fillRect(0,0,GW,GH);
+  octx.strokeStyle = octx.fillStyle = '#fff'; octx.lineCap = octx.lineJoin = 'round';
+  for(const lm of list){
+    const P = lm.map(toGrid), d = (a,b) => Math.hypot(P[a][0]-P[b][0], P[a][1]-P[b][1]);
+    const s = Math.max(d(0,9), d(5,17)/0.8, d(0,17)/0.85), Q = P.map(p => p.slice());
+    if(k === 1){ for(const f of FINGERS) for(let j=1;j<4;j++) Q[f[j]] = lerp(P[f[0]], P[f[j]], 0.93); }
+    const C = [0,5,9,13,17].reduce((a,i)=>[a[0]+Q[i][0]/5, a[1]+Q[i][1]/5],[0,0]);
+    const outv = (p,amt) => { const u = norm([p[0]-C[0],p[1]-C[1]]); return [p[0]+u[0]*amt*s, p[1]+u[1]*amt*s]; };
+    const u = norm([5,9,13,17].reduce((a,i)=>[a[0]+Q[0][0]-Q[i][0], a[1]+Q[0][1]-Q[i][1]],[0,0]));
+    const Z = [Q[0][0]+u[0]*s*0.06, Q[0][1]+u[1]*s*0.06];
+    const T = outv(lerp(Q[0],Q[1],0.5), 0.08), H = outv(lerp(Q[17],Q[0],0.5), 0.06);
+    octx.beginPath(); [Z,T,Q[1],Q[2],Q[5],Q[9],Q[13],Q[17],H].forEach((p,i)=>octx[i?'lineTo':'moveTo'](p[0],p[1]));
+    octx.closePath(); octx.fill(); octx.lineWidth = s*0.13*k; octx.stroke();
+    // 虎口
+    const nv = norm([Q[5][0]-Q[2][0], Q[5][1]-Q[2][1]]);
+    const A0 = lerp(Q[2],Q[3],0.3), B0 = lerp(Q[5],Q[6],0.22), M = lerp(Q[2],Q[5],0.5);
+    const A = [A0[0]+nv[0]*s*THUMB_W[1]*0.45, A0[1]+nv[1]*s*THUMB_W[1]*0.45];
+    const B = [B0[0]-nv[0]*s*FINGER_W[0]*0.45, B0[1]-nv[1]*s*FINGER_W[0]*0.45];
+    octx.beginPath(); octx.moveTo(...Q[2]); octx.lineTo(...A); octx.quadraticCurveTo(M[0],M[1],B[0],B[1]);
+    octx.lineTo(...Q[5]); octx.closePath(); octx.fill();
+    FINGERS.forEach((f,fi)=>{ for(let j=0;j<3;j++){
+      octx.lineWidth = s*FINGER_W[j]*FINGER_MUL[fi]*k;
+      octx.beginPath(); octx.moveTo(...Q[f[j]]); octx.lineTo(...Q[f[j+1]]); octx.stroke(); } });
+    for(let j=0;j<3;j++){
+      octx.lineWidth = s*THUMB_W[j]*k;
+      octx.beginPath(); octx.moveTo(...Q[j+1]); octx.lineTo(...Q[j+2]); octx.stroke();
+    }
+  }
+  const data = octx.getImageData(0,0,GW,GH).data;
+  for(let i=0;i<GW*GH;i++) out[i] = data[i*4]/255;
+}
+const sstep = (a,b,x) => { x = Math.min(1,Math.max(0,(x-a)/(b-a))); return x*x*(3-2*x); };
+function smoothMask(){                         // 仅备用方案使用
+  const R=2, n=5, t=new Float32Array(GW*GH);
+  for(let y=0;y<GH;y++)for(let x=0;x<GW;x++){ let a=0; for(let j=-R;j<=R;j++) a+=target[y*GW+Math.min(GW-1,Math.max(0,x+j))]; t[y*GW+x]=a/n; }
+  for(let y=0;y<GH;y++)for(let x=0;x<GW;x++){ let a=0; for(let j=-R;j<=R;j++) a+=t[Math.min(GH-1,Math.max(0,y+j))*GW+x]; target[y*GW+x]=sstep(0.32,0.62,a/n); }
+}
+
+// ---------- 2) 真实分割:MediaPipe 多类别人像分割(body-skin 类 = 手和手臂) ----------
+let segmenter = null;
+const sc = document.createElement('canvas'), sctx = sc.getContext('2d');
+(async () => {
+  try{
+    const V = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+    const mod = await import(V + '/vision_bundle.mjs');
+    const files = await mod.FilesetResolver.forVisionTasks(V + '/wasm');
+    segmenter = await mod.ImageSegmenter.createFromOptions(files, {
+      baseOptions:{ modelAssetPath:'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite', delegate:'CPU' },
+      runningMode:'IMAGE', outputConfidenceMasks:true, outputCategoryMask:false });
+    hint('');                                   // 加载完成后清空提示(键盘 1 / 2 测试功能仍然可用)
+  }catch(e){ console.warn('segmenter failed', e); hint('Segmentation model failed to load, using skeleton outline instead (internet needed)'); }
+})();
+
+function buildLut(mw, mh){                      // 网格坐标 -> 分割图坐标(镜像 + cover 裁切)
+  const vw = cam.videoWidth, vh = cam.videoHeight, ar = vw/vh, fa = GW/GH;
+  for(let gy=0;gy<GH;gy++)for(let gx=0;gx<GW;gx++){
+    let xi = 1-(gx+0.5)/GW, yi = (gy+0.5)/GH;
+    if(ar > fa){ const f = fa/ar; xi = xi*f+(1-f)/2; } else { const f = ar/fa; yi = yi*f+(1-f)/2; }
+    lut[gy*GW+gx] = Math.min(mh-1,Math.floor(yi*mh))*mw + Math.min(mw-1,Math.floor(xi*mw));
+  }
+  lutKey = `${GW}x${GH}x${mw}x${mh}x${vw}x${vh}`;
+}
+function runSeg(){
+  const vw = cam.videoWidth, vh = cam.videoHeight, sw = 256, sh = Math.round(256*vh/vw);
+  if(sc.width !== sw || sc.height !== sh){ sc.width = sw; sc.height = sh; }
+  sctx.drawImage(cam, 0, 0, sw, sh);
+  segmenter.segment(sc, res => {
+    const m = res.confidenceMasks[2], a = m.getAsFloat32Array();     // 2 = body-skin
+    if(lutKey !== `${GW}x${GH}x${m.width}x${m.height}x${vw}x${vh}`) buildLut(m.width, m.height);
+    for(let i=0;i<GW*GH;i++) target[i] = sstep(SEG_LOW, SEG_HIGH, a[lut[i]]) * roi[i];
+  });
+}
+
+// ---------- 3) 主循环 ----------
+const hands = new Hands({locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}`});
+hands.setOptions({maxNumHands:2, modelComplexity:0, minDetectionConfidence:0.6, minTrackingConfidence:0.5});
+let handCount = 0;
+hands.onResults(r => {
+  const list = r.multiHandLandmarks || []; handCount = list.length;
+  if(handCount) drawEnvelope(list, segmenter ? 2.0 : 1, roi); else roi.fill(0);
+});
+
+navigator.mediaDevices.getUserMedia({video:{width:1280,height:720}, audio:false})
+  .then(s => { cam.srcObject = s; cam.onloadeddata = () => { requestAnimationFrame(loop); inferLoop(); }; })
+  .catch(e => hint('Cannot open camera: ' + e.message));
+
+// 推理(手部关键点 + 分割)和绘制分开跑:画面始终顺滑,推理慢一点也不会卡
+let frame = 0;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function inferLoop(){
+  for(;;){
+    if(!document.body.classList.contains('s10') && !trans){ target.fill(0); await sleep(80); continue; }
+    try{
+      if(frame++ % 2 === 0) await hands.send({image:cam});     // 关键点每两轮更新一次,只用来圈范围
+      if(!handCount) target.fill(0);
+      else if(segmenter){
+        try{ runSeg(); }catch(e){ console.warn(e); segmenter = null; hint('Segmentation error, using skeleton outline instead'); }
+      } else { target.set(roi); smoothMask(); }
+    }catch(e){ hint('Hand model failed to load (internet needed): ' + e.message); await sleep(500); }
+    await new Promise(r => requestAnimationFrame(r));
+  }
+}
+let hasInk = false;
+function loop(){ requestAnimationFrame(loop); render(); }
+
+// ---------- 渲染 ----------
+const DUR = 2200;                                   // (1,0)->(1,1) 渐变总时长(毫秒)
+const colorCache = [];
+const cstr = (r,g,b) => { const k = ((r>>3)<<10)|((g>>3)<<5)|(b>>3);
+  return colorCache[k] || (colorCache[k] = `rgb(${r&0xf8},${g&0xf8},${b&0xf8})`); };
+function sampleColors(){                            // 每个像素格对应的摄像头真实颜色
+  const vw = cam.videoWidth, vh = cam.videoHeight, ar = vw/vh, fa = GW/GH; let sw, sh, sx, sy;
+  if(ar > fa){ sh = vh; sw = vh*fa; sx = (vw-sw)/2; sy = 0; } else { sw = vw; sh = vw/fa; sx = 0; sy = (vh-sh)/2; }
+  cctx.save(); cctx.translate(GW,0); cctx.scale(-1,1); cctx.drawImage(cam, sx,sy,sw,sh, 0,0,GW,GH); cctx.restore();
+  return cctx.getImageData(0,0,GW,GH).data;
+}
+function render(){
+  const show = document.body.classList.contains('s10');
+  if(!hasInk && !show && !trans) return;            // 空闲时不画
+  const W = innerWidth, H = innerHeight, dpr = devicePixelRatio||1;
+  let col = null, cb = 0, d = 0;
+  if(trans){
+    const p = (performance.now()-tStart)/DUR;
+    if(p >= 1){                                     // 渐变结束:清空像素层,只剩中间的摄像头
+      trans = false; document.body.classList.remove('trans');
+      mask.fill(0); target.fill(0); ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H); hasInk = false; return;
+    }
+    col = sampleColors();
+    cb = sstep(0, 0.35, p);                         // 黑 -> 摄像头颜色
+    d  = sstep(0.3, 1, p);                          // 像素逐渐散开、消退
+  }
+  for(let y=0;y<GH;y++)for(let x=0;x<GW;x++){
+    let s=0,n=0;
+    for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){
+      const xx=x+dx, yy=y+dy;
+      if(xx>=0&&xx<GW&&yy>=0&&yy<GH){ s+=target[yy*GW+xx]; n++; }
+    }
+    const i=y*GW+x; mask[i] = mask[i]*0.5 + (s/n)*0.5;
+  }
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,W,H);
+  const cw=W/GW, ch=H/GH; let ink = false;
+  if(!col){
+    ctx.fillStyle='#000'; ctx.beginPath();
+    for(let i=0;i<GW*GH;i++){
+      const m = mask[i];
+      if(m > 0.1 && m > rnd[i]*0.7){               // 边缘散成零星像素
+        ink = true; const sz = Math.min(1, 0.4 + m*0.65);
+        ctx.rect((i%GW)*cw + cw*(1-sz)/2, ((i/GW)|0)*ch + ch*(1-sz)/2, cw*sz*0.9, ch*sz*0.9);
+      }
+    }
+    ctx.fill();
+  } else {
+    for(let i=0;i<GW*GH;i++){
+      const m = mask[i];
+      if(!(m > 0.1 && m > rnd[i]*0.7)) continue;
+      const a = Math.min(1, Math.max(0, 1 - (d - rndB[i]*0.75)/0.25));   // 每个像素在各自的时间点淡出
+      if(a <= 0) continue;
+      ink = true;
+      const sz = Math.min(1, 0.4 + m*0.65) * (0.55 + 0.45*a);
+      const ox = (rndC[i]-0.5)*d*cw*10, oy = -(rndB[i]*0.8+0.2)*d*ch*8;   // 散开并轻轻上飘
+      ctx.globalAlpha = a;
+      ctx.fillStyle = cstr(col[i*4]*cb|0, col[i*4+1]*cb|0, col[i*4+2]*cb|0);
+      ctx.fillRect((i%GW)*cw + cw*(1-sz)/2 + ox, ((i/GW)|0)*ch + ch*(1-sz)/2 + oy, cw*sz*0.9, ch*sz*0.9);
+    }
+    ctx.globalAlpha = 1;
+  }
+  hasInk = ink;
+}
+
+// ---------- Gallery:抓拍"交接的那一瞬间",保存在浏览器里,刷新/重开不会清空 ----------
+const SAVE_MIRRORED = false;     // false:Gallery 里保存为正向照片(和屏幕上的镜像画面相反);true:和屏幕上看到的一致
+const CAPTURE_DELAY = 900;      // 接触后延迟多久抓拍(毫秒)
+const COOLDOWN = 2000;           // 两次抓拍的最短间隔(毫秒),防止接触点抖动造成连拍
+let db = null, memPhotos = [], lastCap = 0, galleryOpen = false, urls = [];
+const dbReady = new Promise(res => {
+  try{
+    const rq = indexedDB.open('handover-gallery', 1);
+    rq.onupgradeneeded = () => rq.result.createObjectStore('photos', {keyPath:'id', autoIncrement:true});
+    rq.onsuccess = () => { db = rq.result; res(); };
+    rq.onerror = () => res();
+  }catch(e){ res(); }
+});
+const store = mode => db.transaction('photos', mode).objectStore('photos');
+const wrap = rq => new Promise((res, rej) => { rq.onsuccess = () => res(rq.result); rq.onerror = () => rej(rq.error); });
+async function dbAll(){ await dbReady; return db ? wrap(store('readonly').getAll()) : memPhotos.slice(); }
+async function dbAdd(r){ await dbReady; if(!db){ r.id = Date.now()+Math.random(); memPhotos.push(r); return; } await wrap(store('readwrite').add(r)); }
+async function dbDel(id){ await dbReady; if(!db){ memPhotos = memPhotos.filter(p => p.id !== id); return; } await wrap(store('readwrite').delete(id)); }
+async function dbClear(){ await dbReady; if(!db){ memPhotos = []; return; } await wrap(store('readwrite').clear()); }
+
+const toBlobP = (c, q) => new Promise(r => c.toBlob(r, 'image/jpeg', q));
+function capture(){
+  if(!cam.videoWidth) return;
+  const now = Date.now(); if(now - lastCap < COOLDOWN) return; lastCap = now;
+  const vw = cam.videoWidth, vh = cam.videoHeight;                 // 裁出和页面中间画面一致的 4:3 区域
+  let sw, sh, sx, sy;
+  if(vw/vh > 4/3){ sh = vh; sw = vh*4/3; sx = (vw-sw)/2; sy = 0; } else { sw = vw; sh = vw*3/4; sx = 0; sy = (vh-sh)/2; }
+  const w = Math.min(1280, Math.round(sw)), h = Math.round(w*3/4);
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const x = c.getContext('2d');
+  if(SAVE_MIRRORED){ x.translate(w,0); x.scale(-1,1); }
+  x.drawImage(cam, sx, sy, sw, sh, 0, 0, w, h);                    // 此刻的实时画面(同步取帧)
+  const tc = document.createElement('canvas'); tc.width = 480; tc.height = 360;   // 相册网格用的小图,省内存
+  tc.getContext('2d').drawImage(c, 0, 0, 480, 360);
+  Promise.all([toBlobP(c, 0.88), toBlobP(tc, 0.8)]).then(async ([blob, thumb]) => {
+    await dbAdd({t:now, blob, thumb});
+    const btn = $('btnGallery'); btn.classList.add('pulse'); setTimeout(() => btn.classList.remove('pulse'), 700);
+    if(galleryOpen) renderGallery(); else refreshCount();
+  });
+}
+async function dbCount(){ await dbReady; return db ? wrap(store('readonly').count()) : memPhotos.length; }
+async function refreshCount(){ const n = await dbCount(); $('btnGallery').textContent = `Gallery (${n})`; return n; }
+const pad = n => String(n).padStart(2,'0');
+const stamp = t => { const d = new Date(t); return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`; };
+async function renderGallery(){
+  const all = (await dbAll()).sort((a,b) => b.t - a.t);
+  $('btnGallery').textContent = `Gallery (${all.length})`; $('galCount').textContent = `${all.length} photo${all.length===1?'':'s'}`;
+  urls.forEach(u => URL.revokeObjectURL(u)); urls = [];
+  const g = $('grid'); g.innerHTML = ''; $('galEmpty').hidden = all.length > 0;
+  for(const p of all){
+    const u = URL.createObjectURL(p.thumb || p.blob); urls.push(u);
+    const f = document.createElement('figure'), im = document.createElement('img'), cap = document.createElement('figcaption');
+    im.src = u; im.loading = 'lazy'; im.decoding = 'async'; im.onclick = () => openBox(p); cap.textContent = new Date(p.t).toLocaleString('en-GB');
+    f.append(im, cap); g.appendChild(f);
+  }
+}
+let boxPhoto = null, boxUrl = null;
+function closeBox(){ $('box').hidden = true; $('boxImg').removeAttribute('src'); if(boxUrl){ URL.revokeObjectURL(boxUrl); boxUrl = null; } }
+function openBox(p){
+  closeBox(); boxPhoto = p; boxUrl = URL.createObjectURL(p.blob);
+  $('boxImg').src = boxUrl; $('boxTime').textContent = new Date(p.t).toLocaleString('en-GB');
+  $('boxDl').href = boxUrl; $('boxDl').download = `handover-${stamp(p.t)}.jpg`; $('box').hidden = false;
+}
+$('btnGallery').onclick = () => { galleryOpen = true; $('gallery').hidden = false; renderGallery(); };
+$('btnClose').onclick = () => { galleryOpen = false; $('gallery').hidden = true; closeBox(); urls.forEach(u => URL.revokeObjectURL(u)); urls = []; $('grid').innerHTML = ''; };
+$('boxClose').onclick = closeBox;
+$('boxDel').onclick = async () => { if(boxPhoto){ await dbDel(boxPhoto.id); closeBox(); renderGallery(); } };
+$('btnClear').onclick = async () => { if(confirm('Delete all photos in the Gallery? This cannot be undone.')){ await dbClear(); renderGallery(); } };
+addEventListener('keydown', e => { if(e.key === 'Escape'){ if(!$('box').hidden) closeBox(); else if(galleryOpen) $('btnClose').onclick(); } });
+refreshCount();
+
+// ---------- (0,0) 空白界面:轮流淡入淡出的三句提示 ----------
+const PROMPTS = ['Ready to share?', 'Hold it up to the camera', 'Have a look at the guide'];
+const PROMPT_HOLD = 2000, PROMPT_FADE = 800;      // 每句话完全显示的时长 / 淡入淡出的时长(毫秒)
+let promptIdx = 0, promptOn = false, promptTimer = null;
+function promptStep(){
+  if(!promptOn) return;
+  const el = $('prompt');
+  el.textContent = PROMPTS[promptIdx]; promptIdx = (promptIdx + 1) % PROMPTS.length;
+  el.classList.add('on');
+  promptTimer = setTimeout(() => {
+    el.classList.remove('on');
+    promptTimer = setTimeout(promptStep, PROMPT_FADE + 150);       // 等上一句完全淡出,再换下一句
+  }, PROMPT_FADE + PROMPT_HOLD);
+}
+function updatePrompt(cls){
+  const el = $('prompt');
+  if(cls === 's00'){
+    if(!promptOn){ promptOn = true; promptIdx = 0; el.style.transitionDuration = ''; clearTimeout(promptTimer); promptTimer = setTimeout(promptStep, 400); }
+  } else if(promptOn){
+    promptOn = false; clearTimeout(promptTimer); el.style.transitionDuration = '.25s'; el.classList.remove('on');   // 一有接触就很快淡出
+  }
+}
+updatePrompt('s00');
+</script>
+</body>
+</html>
